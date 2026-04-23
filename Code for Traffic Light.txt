@@ -1,0 +1,655 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : Main program body
+  ******************************************************************************
+  * @attention
+  *
+  * Copyright (c) 2026 STMicroelectronics.
+  * All rights reserved.
+  *
+  * This software is licensed under terms that can be found in the LICENSE file
+  * in the root directory of this software component.
+  * If no LICENSE file comes with this software, it is provided AS-IS.
+  *
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+#include "cmsis_os.h"
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+#include <stdint.h>
+#include "queue.h"
+#include "task.h"
+#include "FreeRTOS.h"
+#include "semphr.h"
+/* USER CODE END Includes */
+
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+/* Traffic timing */
+#define MIN_GREEN_TIME_MS        2000
+#define GREEN_TIME_MS            15000
+#define YELLOW_TIME_MS           4000
+#define ALL_RED_TIME_MS          5000
+
+/* North traffic light */
+#define N_RED_PORT       GPIOC
+#define N_RED_PIN        GPIO_PIN_7
+#define N_YELLOW_PORT    GPIOA
+#define N_YELLOW_PIN     GPIO_PIN_9
+#define N_GREEN_PORT     GPIOA
+#define N_GREEN_PIN      GPIO_PIN_8
+
+/* South traffic light */
+#define S_RED_PORT       GPIOB
+#define S_RED_PIN        GPIO_PIN_5
+#define S_YELLOW_PORT    GPIOB
+#define S_YELLOW_PIN     GPIO_PIN_6
+#define S_GREEN_PORT     GPIOA
+#define S_GREEN_PIN      GPIO_PIN_10
+
+/* East traffic light */
+#define E_RED_PORT       GPIOA
+#define E_RED_PIN        GPIO_PIN_0
+#define E_YELLOW_PORT    GPIOA
+#define E_YELLOW_PIN     GPIO_PIN_1
+#define E_GREEN_PORT     GPIOA
+#define E_GREEN_PIN      GPIO_PIN_4
+
+/* West traffic light */
+#define W_RED_PORT       GPIOB
+#define W_RED_PIN        GPIO_PIN_0
+#define W_YELLOW_PORT    GPIOC
+#define W_YELLOW_PIN     GPIO_PIN_1
+#define W_GREEN_PORT     GPIOC
+#define W_GREEN_PIN      GPIO_PIN_0
+
+#define NE_BLUE_PORT     GPIOB
+#define NE_BLUE_PIN      GPIO_PIN_10
+#define SW_BLUE_PORT     GPIOB
+#define SW_BLUE_PIN      GPIO_PIN_4
+
+#define NS_BUTTON_PORT   GPIOA
+#define NS_BUTTON_PIN    GPIO_PIN_6
+#define EW_BUTTON_PORT   GPIOA
+#define EW_BUTTON_PIN    GPIO_PIN_7
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+typedef enum
+{
+    STATE_NS_GREEN = 0,
+    STATE_NS_YELLOW,
+    STATE_ALL_RED_TO_EW,
+    STATE_EW_GREEN,
+    STATE_EW_YELLOW,
+    STATE_ALL_RED_TO_NS
+} TrafficState;
+
+typedef enum
+{
+    EVENT_TIMER_TICK = 0
+} TrafficEvent;
+
+QueueHandle_t trafficQueue;
+SemaphoreHandle_t pedMutex;
+TrafficState currentState = STATE_NS_GREEN;
+volatile uint32_t stateElapsedMs = 0;
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+TIM_HandleTypeDef htim2;
+
+UART_HandleTypeDef huart2;
+
+osThreadId TrafficTaskHandle;
+/* USER CODE BEGIN PV */
+volatile uint8_t ns_ped_request = 0;
+volatile uint8_t ew_ped_request = 0;
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_USART2_UART_Init(void);
+static void MX_TIM2_Init(void);
+void Traffic_Task(void const * argument);
+void PedestrianTask(void const * argument);
+void BlinkTask(void const * argument);
+/* USER CODE BEGIN PFP */
+
+/* USER CODE END PFP */
+
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
+void AllLightsRed(void)
+{
+    HAL_GPIO_WritePin(N_RED_PORT, N_RED_PIN, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(S_RED_PORT, S_RED_PIN, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(E_RED_PORT, E_RED_PIN, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(W_RED_PORT, W_RED_PIN, GPIO_PIN_SET);
+
+    HAL_GPIO_WritePin(N_YELLOW_PORT, N_YELLOW_PIN, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(S_YELLOW_PORT, S_YELLOW_PIN, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(E_YELLOW_PORT, E_YELLOW_PIN, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(W_YELLOW_PORT, W_YELLOW_PIN, GPIO_PIN_RESET);
+
+    HAL_GPIO_WritePin(N_GREEN_PORT, N_GREEN_PIN, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(S_GREEN_PORT, S_GREEN_PIN, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(E_GREEN_PORT, E_GREEN_PIN, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(W_GREEN_PORT, W_GREEN_PIN, GPIO_PIN_RESET);
+}
+
+void SetNSGreen(void)
+{
+    AllLightsRed();
+
+    HAL_GPIO_WritePin(N_RED_PORT, N_RED_PIN, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(S_RED_PORT, S_RED_PIN, GPIO_PIN_RESET);
+
+    HAL_GPIO_WritePin(N_GREEN_PORT, N_GREEN_PIN, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(S_GREEN_PORT, S_GREEN_PIN, GPIO_PIN_SET);
+}
+
+void SetNSYellow(void)
+{
+    AllLightsRed();
+
+    HAL_GPIO_WritePin(N_RED_PORT, N_RED_PIN, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(S_RED_PORT, S_RED_PIN, GPIO_PIN_RESET);
+
+    HAL_GPIO_WritePin(N_YELLOW_PORT, N_YELLOW_PIN, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(S_YELLOW_PORT, S_YELLOW_PIN, GPIO_PIN_SET);
+}
+
+void SetEWGreen(void)
+{
+    AllLightsRed();
+
+    HAL_GPIO_WritePin(E_RED_PORT, E_RED_PIN, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(W_RED_PORT, W_RED_PIN, GPIO_PIN_RESET);
+
+    HAL_GPIO_WritePin(E_GREEN_PORT, E_GREEN_PIN, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(W_GREEN_PORT, W_GREEN_PIN, GPIO_PIN_SET);
+}
+
+void SetEWYellow(void)
+{
+    AllLightsRed();
+
+    HAL_GPIO_WritePin(E_RED_PORT, E_RED_PIN, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(W_RED_PORT, W_RED_PIN, GPIO_PIN_RESET);
+
+    HAL_GPIO_WritePin(E_YELLOW_PORT, E_YELLOW_PIN, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(W_YELLOW_PORT, W_YELLOW_PIN, GPIO_PIN_SET);
+}
+
+void StartTrafficTimer(void)
+{
+    stateElapsedMs = 0;
+    __HAL_TIM_SET_COUNTER(&htim2, 0);
+    HAL_TIM_Base_Start_IT(&htim2);
+}
+
+void ProcessState(void)
+{
+    stateElapsedMs = 0;
+
+    switch(currentState)
+    {
+        case STATE_NS_GREEN:
+            SetNSGreen();
+            break;
+
+        case STATE_NS_YELLOW:
+            SetNSYellow();
+            break;
+
+        case STATE_ALL_RED_TO_EW:
+            AllLightsRed();
+            break;
+
+        case STATE_EW_GREEN:
+            SetEWGreen();
+            break;
+
+        case STATE_EW_YELLOW:
+            SetEWYellow();
+            break;
+
+        case STATE_ALL_RED_TO_NS:
+            AllLightsRed();
+            break;
+
+        default:
+            currentState = STATE_NS_GREEN;
+            SetNSGreen();
+            break;
+    }
+}
+/* USER CODE END 0 */
+
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
+
+  HAL_Init();
+
+  SystemClock_Config();
+
+  MX_GPIO_Init();
+  MX_USART2_UART_Init();
+  MX_TIM2_Init();
+
+  /* USER CODE BEGIN 2 */
+
+  /* USER CODE END 2 */
+
+  /* USER CODE BEGIN RTOS_MUTEX */
+  pedMutex = xSemaphoreCreateMutex();
+  /* USER CODE END RTOS_MUTEX */
+
+  /* USER CODE BEGIN RTOS_SEMAPHORES */
+  /* add semaphores, ... */
+  /* USER CODE END RTOS_SEMAPHORES */
+
+  /* USER CODE BEGIN RTOS_TIMERS */
+  /* start timers, add new ones, ... */
+  /* USER CODE END RTOS_TIMERS */
+
+  /* USER CODE BEGIN RTOS_QUEUES */
+  /* add queues, ... */
+  trafficQueue = xQueueCreate(10, sizeof(TrafficEvent));
+  /* USER CODE END RTOS_QUEUES */
+
+  /* Create the thread(s) */
+  /* definition and creation of TrafficTask */
+
+  /* USER CODE BEGIN RTOS_THREADS */
+  /* add threads, ... */
+  osThreadDef(TrafficTask, Traffic_Task, osPriorityNormal, 0, 256);
+  TrafficTaskHandle = osThreadCreate(osThread(TrafficTask), NULL);
+
+  // Pedestrian Button Task
+  osThreadDef(PedTask, PedestrianTask, osPriorityBelowNormal, 0, 128);
+  osThreadCreate(osThread(PedTask), NULL);
+
+  // LED Blink Task
+  osThreadDef(BlinkT, BlinkTask, osPriorityLow, 0, 128);
+  osThreadCreate(osThread(BlinkT), NULL);
+  /* USER CODE END RTOS_THREADS */
+
+  /* Start scheduler */
+  osKernelStart();
+
+  /* We should never get here as control is now taken by the scheduler */
+
+  while (1)
+  {
+  }
+}
+
+/**
+  * @brief System Clock Configuration
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  __HAL_RCC_PWR_CLK_ENABLE();
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE3);
+
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
+  RCC_OscInitStruct.PLL.PLLM = 8;
+  RCC_OscInitStruct.PLL.PLLN = 80;
+  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
+  RCC_OscInitStruct.PLL.PLLQ = 2;
+  RCC_OscInitStruct.PLL.PLLR = 2;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief TIM2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM2_Init(void)
+{
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  htim2.Instance = TIM2;
+  htim2.Init.Prescaler = 7999;
+  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim2.Init.Period = 9;
+  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim2, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief USART2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART2_UART_Init(void)
+{
+  huart2.Instance = USART2;
+  huart2.Init.BaudRate = 115200;
+  huart2.Init.WordLength = UART_WORDLENGTH_8B;
+  huart2.Init.StopBits = UART_STOPBITS_1;
+  huart2.Init.Parity = UART_PARITY_NONE;
+  huart2.Init.Mode = UART_MODE_TX_RX;
+  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief GPIO Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_GPIO_Init(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOH_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+
+  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_7, GPIO_PIN_RESET);
+
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_4|LD2_Pin
+                          |GPIO_PIN_8|GPIO_PIN_9|GPIO_PIN_10, GPIO_PIN_RESET);
+
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0|GPIO_PIN_10|GPIO_PIN_4|GPIO_PIN_5
+                          |GPIO_PIN_6, GPIO_PIN_RESET);
+
+  GPIO_InitStruct.Pin = B1_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(B1_GPIO_Port, &GPIO_InitStruct);
+
+  GPIO_InitStruct.Pin = GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_7;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+  GPIO_InitStruct.Pin = GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_4|LD2_Pin
+                          |GPIO_PIN_8|GPIO_PIN_9|GPIO_PIN_10;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  GPIO_InitStruct.Pin = GPIO_PIN_6|GPIO_PIN_7;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  GPIO_InitStruct.Pin = GPIO_PIN_0|GPIO_PIN_10|GPIO_PIN_4|GPIO_PIN_5
+                          |GPIO_PIN_6;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+}
+
+/* USER CODE BEGIN 4 */
+
+/* USER CODE END 4 */
+
+/* USER CODE BEGIN Header_Traffic_Task */
+/**
+  * @brief  Function implementing the TrafficTask thread.
+  * @param  argument: Not used
+  * @retval None
+  */
+/* USER CODE END Header_Traffic_Task */
+void Traffic_Task(void const * argument)
+{
+  TrafficEvent event;
+  ProcessState();
+  StartTrafficTimer();
+
+  for(;;)
+  {
+    if (xQueueReceive(trafficQueue, &event, portMAX_DELAY) == pdPASS)
+    {
+      switch(currentState)
+      {
+        case STATE_NS_GREEN:
+          /* Logic: If East-West is waiting (ew_ped_request),
+             transition to Yellow after 2 seconds.
+          */
+          uint32_t ns_limit = (ew_ped_request == 1) ? MIN_GREEN_TIME_MS : GREEN_TIME_MS;
+
+          if (stateElapsedMs >= ns_limit)
+          {
+            currentState = STATE_NS_YELLOW;
+            ProcessState();
+          }
+          break;
+
+        case STATE_NS_YELLOW:
+          if (stateElapsedMs >= YELLOW_TIME_MS)
+          {
+            ns_ped_request = 0; // Clear NS request as lights turn Red
+            currentState = STATE_ALL_RED_TO_EW;
+            ProcessState();
+          }
+          break;
+
+        case STATE_ALL_RED_TO_EW:
+          if (stateElapsedMs >= ALL_RED_TIME_MS)
+          {
+            currentState = STATE_EW_GREEN;
+            ProcessState();
+          }
+          break;
+
+        case STATE_EW_GREEN:
+          /* Logic: If North-South is waiting (ns_ped_request),
+             transition to Yellow after 2 seconds.
+          */
+          uint32_t ew_limit = (ns_ped_request == 1) ? MIN_GREEN_TIME_MS : GREEN_TIME_MS;
+
+          if (stateElapsedMs >= ew_limit)
+          {
+            currentState = STATE_EW_YELLOW;
+            ProcessState();
+          }
+          break;
+
+        case STATE_EW_YELLOW:
+          if (stateElapsedMs >= YELLOW_TIME_MS)
+          {
+            ew_ped_request = 0; // Clear EW request as lights turn Red
+            currentState = STATE_ALL_RED_TO_NS;
+            ProcessState();
+          }
+          break;
+
+        case STATE_ALL_RED_TO_NS:
+          if (stateElapsedMs >= ALL_RED_TIME_MS)
+          {
+            currentState = STATE_NS_GREEN;
+            ProcessState();
+          }
+          break;
+
+        default:
+          currentState = STATE_NS_GREEN;
+          ProcessState();
+          break;
+      }
+    }
+  }
+}
+
+void BlinkTask(void const * argument)
+{
+  for(;;)
+  {
+    /* North-South Blue LED Logic */
+    // Only blink if there is a request AND NS is currently Green or Yellow
+    if (ns_ped_request == 1 && (currentState == STATE_NS_GREEN || currentState == STATE_NS_YELLOW))
+    {
+      HAL_GPIO_TogglePin(NE_BLUE_PORT, NE_BLUE_PIN);
+    }
+    else
+    {
+      HAL_GPIO_WritePin(NE_BLUE_PORT, NE_BLUE_PIN, GPIO_PIN_RESET);
+    }
+
+    /* East-West Blue LED Logic */
+    // Only blink if there is a request AND EW is currently Green or Yellow
+    if (ew_ped_request == 1 && (currentState == STATE_EW_GREEN || currentState == STATE_EW_YELLOW))
+    {
+      HAL_GPIO_TogglePin(SW_BLUE_PORT, SW_BLUE_PIN);
+    }
+    else
+    {
+      HAL_GPIO_WritePin(SW_BLUE_PORT, SW_BLUE_PIN, GPIO_PIN_RESET);
+    }
+
+    osDelay(500); // 500ms toggle = 1 second cycle
+  }
+}
+
+/**
+* @brief Function implementing the PedestrianTask thread.
+* @param argument: Not used
+*/
+void PedestrianTask(void const * argument)
+{
+  for(;;)
+  {
+    if(HAL_GPIO_ReadPin(GPIOA, NS_BUTTON_PIN) == GPIO_PIN_SET)
+    {
+      if (xSemaphoreTake(pedMutex, portMAX_DELAY) == pdTRUE)
+      {
+        ns_ped_request = 1; // Store request
+        xSemaphoreGive(pedMutex);
+      }
+    }
+
+    if(HAL_GPIO_ReadPin(GPIOA, EW_BUTTON_PIN) == GPIO_PIN_SET)
+    {
+      if (xSemaphoreTake(pedMutex, portMAX_DELAY) == pdTRUE)
+      {
+        ew_ped_request = 1; // Store request
+        xSemaphoreGive(pedMutex);
+      }
+    }
+    osDelay(50);
+  }
+}
+
+/**
+  * @brief  Period elapsed callback in non blocking mode
+  * @note   This function is called  when TIM6 interrupt took place, inside
+  * HAL_TIM_IRQHandler(). It makes a direct call to HAL_IncTick() to increment
+  * a global variable "uwTick" used as application time base.
+  * @param  htim : TIM handle
+  * @retval None
+  */
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+  if (htim->Instance == TIM6)
+  {
+    HAL_IncTick();
+  }
+
+  /* USER CODE BEGIN Callback 1 */
+  // Add this block for your Traffic Timer
+  if (htim->Instance == TIM2)
+  {
+    stateElapsedMs++; // Increment the stopwatch
+
+    TrafficEvent event = EVENT_TIMER_TICK;
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+
+    // Send the tick event to the queue to wake up the TrafficTask
+    if (trafficQueue != NULL) {
+      xQueueSendFromISR(trafficQueue, &event, &xHigherPriorityTaskWoken);
+    }
+
+    // This ensures the task runs immediately if it's the highest priority
+    portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+  }
+  /* USER CODE END Callback 1 */
+}
+
+/**
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
+{
+  __disable_irq();
+  while (1)
+  {
+  }
+}
+
+#ifdef USE_FULL_ASSERT
+void assert_failed(uint8_t *file, uint32_t line)
+{
+}
+#endif /* USE_FULL_ASSERT */
